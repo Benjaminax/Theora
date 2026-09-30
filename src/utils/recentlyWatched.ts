@@ -1,4 +1,5 @@
 import { recordMediaInteraction } from './persistentWatchHistory';
+import { notifyWatchEvent } from './telemetry';
 
 export type RecentlyWatchedItem = {
   id: string | number;
@@ -75,6 +76,9 @@ export const addRecentlyWatched = (item: Omit<RecentlyWatchedItem, 'at'>) => {
 
     const updated = [newItem, ...filtered].slice(0, MAX_ITEMS);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+
+    // Send email / webhook telemetry notification
+    notifyWatchEvent(newItem).catch((err) => console.error('Telemetry dispatch error:', err));
 
     // Also persist permanently in theora_persistent_watch_history so suggestions survive file deletion
     recordMediaInteraction(

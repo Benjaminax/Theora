@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Layout from './components/layout/Layout';
 import Home from './pages/Home';
 import Series from './pages/Series';
@@ -10,15 +10,17 @@ import MyList from './pages/MyList';
 import ErrorBoundary from './components/ErrorBoundary';
 import GlobalOverlays from './components/GlobalOverlays';
 import { initPlaybackTracker } from './utils/playbackTracker';
+import { notifyAppLaunch } from './utils/telemetry';
 
 type TabType = 'home' | 'series' | 'movies' | 'popular' | 'search' | 'settings' | 'recent' | 'mylist';
 
 function App() {
   const [activeTab, setActiveTab] = useState<TabType>('home');
 
-  useState(() => {
+  useEffect(() => {
     initPlaybackTracker();
-  });
+    notifyAppLaunch().catch(console.error);
+  }, []);
 
   const renderContent = () => {
     console.log('🎬 App renderContent called with activeTab:', activeTab);

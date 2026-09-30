@@ -18,6 +18,8 @@
     "bundle-vlc": "node scripts/bundle-vlc.js",
     "dist-with-vlc": "npm run bundle-vlc && npm run build && electron-builder",
     "bundle": "npm run bundle-vlc && npm run build",
+    "dist:mac": "npm run build && electron-builder --mac dmg zip",
+    "build:mac": "npm run build && electron-builder --mac",
     "test-youtube": "electron . --test-youtube",
     "generate-icon": "node scripts/generate-icon.js",
     "dist:with-icon": "npm run build && npm run generate-icon && electron-builder",
@@ -81,7 +83,25 @@
       "node_modules/**/*"
     ],
     "mac": {
-      "category": "public.app-category.entertainment"
+      "category": "public.app-category.entertainment",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
     },
     "win": {
       "target": "nsis",
