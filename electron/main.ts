@@ -688,6 +688,27 @@ ipcMain.handle('open-trailer-window', async (event, { url, title }: { url: strin
 const handleOpenStreamWindow = async (url: string, title: string) => {
   console.log('🌐 Main process: Opening streaming window:', url);
   try {
+    // Set up the streaming session with proper permissions before creating window
+    const streamSession = session.fromPartition('persist:theorastream');
+
+    // Grant media, fullscreen and clipboard permissions needed by streaming embeds
+    streamSession.setPermissionRequestHandler((webContents, permission, callback) => {
+      const allowed = ['media', 'fullscreen', 'openExternal', 'clipboard-read', 'pointerLock'];
+      return callback(allowed.includes(permission));
+    });
+
+    // Strip CSP and X-Frame-Options response headers so quality selectors and
+    // sub-frames embedded by vidsrc can load without being blocked.
+    streamSession.webRequest.onHeadersReceived({ urls: ['<all_urls>'] }, (details, callback) => {
+      const headers = { ...details.responseHeaders };
+      // Remove headers that block quality picker iframes / scripts
+      delete headers['content-security-policy'];
+      delete headers['Content-Security-Policy'];
+      delete headers['x-frame-options'];
+      delete headers['X-Frame-Options'];
+      callback({ responseHeaders: headers });
+    });
+
     const streamWindow = new BrowserWindow({
       width: 1400,
       height: 900,
@@ -698,22 +719,224 @@ const handleOpenStreamWindow = async (url: string, title: string) => {
         nodeIntegration: false,
         contextIsolation: true,
         webSecurity: true,
-        // Using a distinct partition for streaming to isolate storage and cookies
         partition: 'persist:theorastream',
+        allowRunningInsecureContent: false,
       },
     });
 
     // Modern Chrome User-Agent highly compatible with streaming sites
     streamWindow.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
-    // Block unwanted ad popups/windows triggered by stream embeds
+    // Allow quality-selector popups (small player windows opened by vidsrc),
+    // but still block obvious ad/redirect domains.
+    const AD_DOMAINS = /doubleclick|googlesyndication|adservice|popads|popcash|trafficjunky|juicyads/i;
     streamWindow.webContents.setWindowOpenHandler(({ url: popupUrl }) => {
-      console.log('🛑 Blocking popup in stream window:', popupUrl);
-      return { action: 'deny' };
+      if (AD_DOMAINS.test(popupUrl)) {
+        console.log('🛑 Blocking ad popup in stream window:', popupUrl);
+        return { action: 'deny' };
+      }
+      // Allow quality/source picker popups — open them in a new BrowserWindow
+      console.log('✅ Allowing stream popup (quality/source picker):', popupUrl);
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 900,
+          height: 600,
+          autoHideMenuBar: true,
+          backgroundColor: '#000000',
+          webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            partition: 'persist:theorastream',
+          },
+        },
+      };
     });
 
     streamWindow.loadURL(url);
     streamWindow.setMenu(null);
+
+    // --- Auto best-quality injection ---
+    // Runs in the stream window's renderer after every navigation so quality is
+    // always forced to the highest level regardless of which player vidsrc uses.
+    const injectBestQuality = () => {
+      streamWindow.webContents.executeJavaScript(`
+        (function () {
+          'use strict';
+
+          // Resolve the numeric resolution from a quality label string (e.g. "1080p" -> 1080)
+          function labelToRes(label) {
+            if (!label) return 0;
+            const m = String(label).match(/(\\d+)/);
+            return m ? parseInt(m[1], 10) : 0;
+          }
+
+          // ── 1. HLS.js ────────────────────────────────────────────────────
+          // Find any HLS instance attached to a video element and set the
+          // highest quality level.
+          function forceHLSBestQuality() {
+            try {
+              const videos = document.querySelectorAll('video');
+              videos.forEach(video => {
+                const hls = video._hls || (window.Hls && Hls.instances && Hls.instances.find(h => h.media === video));
+                if (!hls) return;
+                // currentLevel = -1 means "auto"; set to highest manual level instead
+                const levels = hls.levels || [];
+                if (!levels.length) return;
+                // Find level with highest bandwidth/height
+                let bestIdx = 0;
+                let bestHeight = 0;
+                levels.forEach((lvl, idx) => {
+                  const h = lvl.height || lvl.attrs && parseInt(lvl.attrs.RESOLUTION && lvl.attrs.RESOLUTION.split('x')[1]) || 0;
+                  if (h > bestHeight) { bestHeight = h; bestIdx = idx; }
+                });
+                if (hls.currentLevel !== bestIdx) {
+                  console.log('[THEORA] HLS: forcing level', bestIdx, '(' + bestHeight + 'p)');
+                  hls.currentLevel = bestIdx;
+                }
+              });
+            } catch (e) { /* ignore */ }
+          }
+
+          // ── 2. video.js ──────────────────────────────────────────────────
+          function forceVideojsBestQuality() {
+            try {
+              if (!window.videojs) return;
+              // videojs stores all players on videojs.players
+              Object.values(videojs.players || {}).forEach(player => {
+                if (!player) return;
+                // qualityLevels plugin
+                if (player.qualityLevels) {
+                  const ql = player.qualityLevels();
+                  let bestIdx = -1, bestH = 0;
+                  for (let i = 0; i < ql.length; i++) {
+                    const h = ql[i].height || 0;
+                    if (h > bestH) { bestH = h; bestIdx = i; }
+                  }
+                  if (bestIdx >= 0) {
+                    for (let i = 0; i < ql.length; i++) {
+                      ql[i].enabled = (i === bestIdx);
+                    }
+                    console.log('[THEORA] video.js qualityLevels: enabled level', bestIdx, '(' + bestH + 'p)');
+                  }
+                }
+                // vhs (videojs-http-streaming) representations
+                if (player.tech && player.tech({ IWillNotUseThisInPlugins: true })) {
+                  const tech = player.tech({ IWillNotUseThisInPlugins: true });
+                  if (tech.vhs && tech.vhs.representations) {
+                    const reps = tech.vhs.representations();
+                    let bestH = 0;
+                    reps.forEach(r => { if ((r.height || 0) > bestH) bestH = r.height; });
+                    reps.forEach(r => { r.enabled(r.height === bestH); });
+                    console.log('[THEORA] VHS representations: enabled', bestH + 'p');
+                  }
+                }
+              });
+            } catch (e) { /* ignore */ }
+          }
+
+          // ── 3. Plyr ──────────────────────────────────────────────────────
+          function forcePlyrBestQuality() {
+            try {
+              if (!window.Plyr) return;
+              document.querySelectorAll('[data-plyr]').forEach(el => {
+                const p = el._plyr;
+                if (!p || !p.quality) return;
+                const qualities = p.config && p.config.quality && p.config.quality.options || [];
+                if (qualities.length) {
+                  const best = Math.max(...qualities);
+                  if (p.quality !== best) {
+                    console.log('[THEORA] Plyr: setting quality to', best);
+                    p.quality = best;
+                  }
+                }
+              });
+            } catch (e) { /* ignore */ }
+          }
+
+          // ── 4. DOM-based quality menus ───────────────────────────────────
+          // Some players render a quality picker in the DOM. Find it and click
+          // the highest available resolution option.
+          function clickBestQualityInDOM() {
+            try {
+              // Common selectors used by jw, flowplayer, clappr, and generic players
+              const menuSelectors = [
+                '.jw-settings-quality .jw-option',        // JW Player
+                '.vjs-quality-selector .vjs-menu-item',   // video.js plugin
+                '.plyr__menu__container [data-plyr="quality"] button',
+                '[class*="quality"] [class*="option"]',
+                '[class*="quality"] [class*="item"]',
+                '[class*="Quality"] [class*="Item"]',
+                '[class*="resolution"] [class*="item"]',
+              ];
+
+              menuSelectors.forEach(sel => {
+                const items = Array.from(document.querySelectorAll(sel));
+                if (!items.length) return;
+
+                // Sort by numeric resolution descending, pick the best
+                const sorted = items.slice().sort((a, b) => {
+                  return labelToRes(b.textContent) - labelToRes(a.textContent);
+                });
+                const best = sorted[0];
+                if (best && !best.classList.contains('active') && !best.classList.contains('selected') && !best.getAttribute('aria-checked')) {
+                  console.log('[THEORA] DOM quality menu: clicking', best.textContent.trim());
+                  best.click();
+                }
+              });
+            } catch (e) { /* ignore */ }
+          }
+
+          // ── 5. HTML5 video track quality (e.g. Dailymotion, etc.) ────────
+          function forceVideoTrackBestQuality() {
+            try {
+              document.querySelectorAll('video').forEach(video => {
+                const tracks = video.videoTracks;
+                if (!tracks || !tracks.length) return;
+                let bestH = 0;
+                for (let i = 0; i < tracks.length; i++) {
+                  const h = tracks[i].height || 0;
+                  if (h > bestH) bestH = h;
+                }
+                for (let i = 0; i < tracks.length; i++) {
+                  tracks[i].selected = (tracks[i].height === bestH);
+                }
+              });
+            } catch (e) { /* ignore */ }
+          }
+
+          // Run all strategies immediately
+          function runAll() {
+            forceHLSBestQuality();
+            forceVideojsBestQuality();
+            forcePlyrBestQuality();
+            clickBestQualityInDOM();
+            forceVideoTrackBestQuality();
+          }
+
+          runAll();
+
+          // Also run shortly after (players often initialise async)
+          setTimeout(runAll, 1500);
+          setTimeout(runAll, 4000);
+          setTimeout(runAll, 8000);
+
+          // Watch for dynamic DOM changes (quality menu appearing later)
+          const observer = new MutationObserver(() => {
+            forceHLSBestQuality();
+            forceVideojsBestQuality();
+            clickBestQualityInDOM();
+          });
+          observer.observe(document.body, { childList: true, subtree: true });
+
+          console.log('[THEORA] Best-quality injection active');
+        })();
+      `).catch(err => console.warn('⚠️ Best-quality injection failed:', err));
+    };
+
+    streamWindow.webContents.on('did-finish-load', injectBestQuality);
+    streamWindow.webContents.on('did-navigate-in-page', injectBestQuality);
+    streamWindow.webContents.on('did-navigate', injectBestQuality);
 
     streamWindow.webContents.on('did-fail-load', (e, code, desc) => {
       console.warn(`🌐 Stream load failed: ${desc} (${code})`);
